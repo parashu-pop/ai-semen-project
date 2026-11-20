@@ -6,8 +6,10 @@ from torchvision import models, transforms
 import joblib
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 import pandas as pd
-import subprocess
 import os
+import hashlib
+import json
+from pathlib import Path
 
 # ================= CONFIG =================
 st.set_page_config(
@@ -447,209 +449,303 @@ padding:15px;
 border-radius:15px;
 box-shadow:0px 3px 10px rgba(0,0,0,0.08);
 ">
-<h2>🎥 AI Video Fertility Analysis</h2>
+<h2>🎥 Automated Sperm Motility Analysis</h2>
 </div>
 """, unsafe_allow_html=True)
 
     uploaded_video = st.file_uploader(
-        "Upload Semen Video",
+        "Upload microscopic video",
         type=["mp4", "avi"]
     )
 
     if uploaded_video:
 
-        # SAVE VIDEO
-        video_path = "temp_video.mp4"
+        video_bytes = uploaded_video.getvalue()
+        video_id = hashlib.sha256(video_bytes).hexdigest()[:12]
+        enhanced_output_dir = os.path.join("outputs", f"enhanced_{video_id}")
 
-        with open(video_path, "wb") as f:
-            f.write(uploaded_video.read())
+        os.makedirs(enhanced_output_dir, exist_ok=True)
+        video_extension = os.path.splitext(uploaded_video.name)[1].lower()
+        video_path = os.path.join(
+            enhanced_output_dir, f"source{video_extension or '.mp4'}"
+        )
+        with open(video_path, "wb") as video_file:
+            video_file.write(video_bytes)
 
-        st.success("Video Uploaded Successfully")
+        st.markdown("### Automated AI Video Analysis")
+        st.markdown(
+            """
+            <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">
+              <span>Upload</span><b>→</b><span>Preprocessing</span><b>→</b>
+              <span>Detection</span><b>→</b><span>Tracking</span><b>→</b>
+              <span>Movement features</span><b>→</b><span>Motility report</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-        if st.button("Analyze Video"):
+        analysis_key = f"enhanced_analysis_{video_id}"
+        if analysis_key not in st.session_state:
+            from tracking.sperm_tracking_enhanced import DEFAULT_MODEL, run_analysis
 
-            with st.spinner(
-                "Running AI sperm tracking..."
-            ):
+            st.markdown("**Live AI detections and tracking IDs**")
+            live_preview = st.empty()
+            progress_bar = st.progress(0.0, text="Preparing video analysis...")
 
-                subprocess.run([
-                    "python",
-                    "tracking/sperm_tracking.py"
-                ])
+            def update_analysis_progress(processed_frames, total_frames):
+                if total_frames > 0:
+                    fraction = min(processed_frames / total_frames, 1.0)
+                    progress_bar.progress(
+                        fraction,
+                        text=(
+                            f"Analyzing frame {processed_frames:,} "
+                            f"of {total_frames:,}"
+                        ),
+                    )
+                else:
+                    progress_bar.progress(
+                        0.0,
+                        text=f"Analyzing frame {processed_frames:,}",
+                    )
 
-                subprocess.run([
-                    "python",
-                    "tracking/generate_metrics.py"
-                ])
+            def update_live_preview(frame):
+                live_preview.image(
+                    frame,
+                    channels="RGB",
+                    caption="Live tracked sperm IDs",
+                    use_container_width=True,
+                )
 
-            st.success("Tracking Completed")
-
-            # ============================================
-            # CHECK CSV
-            # ============================================
-            if not os.path.exists(
-                "outputs/sperm_metrics.csv"
-            ):
-                st.error("CSV NOT created")
-                st.stop()
-
-            st.success("CSV created")
-
-           
-
-            # ============================================
-            # LOAD METRICS
-            # ============================================
-            st.markdown("---")
-
-            st.subheader("📄 Metrics Data")
-
-            metrics_df = pd.read_csv(
-                "outputs/sperm_metrics.csv"
-            )
-            
-           
-
-            st.dataframe(metrics_df)
-
-            latest = metrics_df.iloc[-1]
-
-            total_sperm = int(
-                latest["total_sperm"]
-            )
-
-            progressive_pct = float(
-                latest["progressive_motility_pct"]
-            )
-
-            non_progressive_pct = float(
-                latest["non_progressive_motility_pct"]
-            )
-
-            immotile_pct = float(
-                latest["immotile_pct"]
-            )
-
-            avg_speed = float(
-                latest["average_speed"]
-            )
-            # ============================================
-# RULE BASED FERTILITY PREDICTION
-# ============================================
-
-            if (
-                 progressive_pct >= 40
-                and immotile_pct <= 60
-                and avg_speed >= 5
+            try:
+                with st.spinner(
+                    "Preprocessing video, detecting sperm, and extracting tracks..."
                 ):
+                    st.session_state[analysis_key] = run_analysis(
+                        video_path=Path(os.path.abspath(video_path)),
+                        model_path=DEFAULT_MODEL,
+                        output_dir=Path(os.path.abspath(enhanced_output_dir)),
+                        progress_callback=update_analysis_progress,
+                        preview_callback=update_live_preview,
+                    )
+            except (FileNotFoundError, OSError, RuntimeError, ValueError) as error:
+                progress_bar.empty()
+                st.error(f"Video analysis could not be completed: {error}")
+                st.stop()
+            progress_bar.empty()
 
-                prediction = "Normal Fertility"
+        summary = st.session_state[analysis_key]
+        metadata_frame_count = summary["metadata_frame_count"]
+        frame_count_label = (
+            f"{metadata_frame_count:,} frames (metadata)"
+            if metadata_frame_count > 0
+            else f"{summary['frames_processed']:,} frames processed"
+        )
+        st.caption(
+            f"{summary['width']} × {summary['height']} px · "
+            f"{summary['fps']:g} FPS · {frame_count_label} · "
+            f"{summary['measurement_units']}"
+        )
 
-            else:
+        st.markdown("---")
+        st.subheader("Detection & tracking")
+        detection_col, tracked_col, consistency_col = st.columns(3)
+        detection_col.metric(
+            "Total sperm detections", f"{summary['detections']:,}"
+        )
+        tracked_col.metric("Successfully tracked", f"{summary['unique_tracks']:,}")
+        consistency = summary["tracking_consistency_pct"]
+        consistency_col.metric(
+            "Tracking consistency",
+            f"{consistency:.1f}%" if consistency is not None else "Unavailable",
+        )
+        st.caption(
+            "Tracking consistency is mean frame coverage within each track's observed span."
+        )
 
-                prediction = "Abnormal Fertility"
-            # ============================================
-            # MOTILITY STATISTICS
-            # ============================================
+        def display_metric(value, unit, multiplier=1.0, suffix=""):
+            if value is None:
+                return "Not measurable"
+            return f"{value * multiplier:.2f} {unit}{suffix}"
+
+        average_metrics = summary["average_metrics"]
+        st.markdown("---")
+        st.subheader("Movement analysis")
+        movement_columns = st.columns(4)
+        movement_columns[0].metric(
+            "Curvilinear velocity (VCL)",
+            display_metric(average_metrics["VCL_px_s"], "px/s"),
+        )
+        movement_columns[1].metric(
+            "Straight-line velocity (VSL)",
+            display_metric(average_metrics["VSL_px_s"], "px/s"),
+        )
+        movement_columns[2].metric(
+            "Average path velocity (VAP)",
+            display_metric(average_metrics["VAP_px_s"], "px/s"),
+        )
+        movement_columns[3].metric(
+            "Linearity (LIN)",
+            display_metric(average_metrics["LIN"], "%", 100.0),
+        )
+        movement_columns = st.columns(3)
+        movement_columns[0].metric(
+            "Straightness (STR)",
+            display_metric(average_metrics["STR"], "%", 100.0),
+        )
+        movement_columns[1].metric(
+            "Amplitude of lateral head displacement (ALH)",
+            display_metric(average_metrics["ALH_px"], "px"),
+        )
+        movement_columns[2].metric(
+            "Beat-cross frequency (BCF)",
+            display_metric(average_metrics["BCF_hz_estimate"], "Hz"),
+        )
+
+        st.markdown("---")
+        st.subheader("Motility classification")
+        percentages = summary["motility_percentages"]
+        counts = summary["classification_counts"]
+        motility_columns = st.columns(4)
+        for column, label, key in zip(
+            motility_columns,
+            ("Progressive", "Non-progressive", "Immotile", "Total motile"),
+            ("Progressive", "Non-Progressive", "Immotile", "Total motile"),
+        ):
+            percentage = percentages[key]
+            count = (
+                counts["Progressive"] + counts["Non-Progressive"]
+                if key == "Total motile"
+                else counts[key]
+            )
+            column.metric(
+                label,
+                f"{percentage:.1f}%" if percentage is not None else "Unavailable",
+                f"{count:,} tracks",
+            )
+
+        st.bar_chart(
+            pd.DataFrame(
+                {
+                    "Sperm tracks": {
+                        "Progressive": counts["Progressive"],
+                        "Non-progressive": counts["Non-Progressive"],
+                        "Immotile": counts["Immotile"],
+                    }
+                }
+            )
+        )
+        st.caption(
+            "Percentages are based on tracks classified for motility."
+        )
+
+        st.markdown("---")
+        st.subheader("Video review")
+        original_column, annotated_column = st.columns(2)
+        with original_column:
+            st.markdown("**Original microscopic video**")
+            st.video(video_bytes)
+
+        enhanced_video_path = summary["outputs"]["video"]
+        with annotated_column:
+            st.markdown("**AI detections, tracking IDs & trajectories**")
+            st.caption(
+                "Green: progressive · Amber: non-progressive · "
+                "Red: immotile · Gray: insufficient data"
+            )
+            with open(enhanced_video_path, "rb") as video_file:
+                annotated_video = video_file.read()
+            st.video(annotated_video)
+            st.download_button(
+                "Download annotated video",
+                data=annotated_video,
+                file_name="sperm_tracking_analysis.mp4",
+                mime="video/mp4",
+            )
+
+        tracks_path = summary["outputs"]["tracks_csv"]
+        tracks_df = pd.read_csv(tracks_path)
+        if not tracks_df.empty:
             st.markdown("---")
-
-            st.markdown("""
-                    <h2 style='text-align:center'>
-                    📊 Motility Analysis Dashboard
-                    </h2>
-                    """, unsafe_allow_html=True)
-
-            c1, c2, c3, c4, c5 = st.columns(5)
-
-            c1.metric(
-                "Total Sperm",
-                total_sperm
+            st.subheader("Movement visualizations")
+            track_ids = tracks_df["track_id"].value_counts().head(15).index
+            visible_tracks = tracks_df[
+                tracks_df["track_id"].isin(track_ids)
+            ].copy()
+            trajectory_chart = visible_tracks.pivot_table(
+                index="time_s",
+                columns="track_id",
+                values="x_px",
+                aggfunc="first",
             )
+            trajectory_chart.columns = [
+                f"ID {track_id}" for track_id in trajectory_chart.columns
+            ]
+            st.markdown("**Horizontal position by time (top 15 longest tracks)**")
+            st.line_chart(trajectory_chart)
 
-            c2.metric(
-                "Progressive %",
-                f"{progressive_pct:.2f}%"
+            visible_tracks = visible_tracks.sort_values(["track_id", "frame"])
+            grouped_tracks = visible_tracks.groupby("track_id")
+            dx = grouped_tracks["x_px"].diff()
+            dy = grouped_tracks["y_px"].diff()
+            elapsed_s = grouped_tracks["frame"].diff() / summary["fps"]
+            visible_tracks["speed_px_s"] = (
+                np.sqrt(dx.pow(2) + dy.pow(2)) / elapsed_s.replace(0, np.nan)
             )
-
-            c3.metric(
-                "Non-Progressive %",
-                f"{non_progressive_pct:.2f}%"
+            velocity_chart = visible_tracks.pivot_table(
+                index="time_s",
+                columns="track_id",
+                values="speed_px_s",
+                aggfunc="first",
             )
+            velocity_chart.columns = [
+                f"ID {track_id}" for track_id in velocity_chart.columns
+            ]
+            st.markdown("**Instantaneous tracked velocity (px/s)**")
+            st.line_chart(velocity_chart)
 
-            c4.metric(
-                "Immotile %",
-                f"{immotile_pct:.2f}%"
+        heatmap_path = summary["outputs"]["heatmap"]
+        if os.path.exists(heatmap_path):
+            st.markdown("**Movement density**")
+            st.image(heatmap_path)
+
+        st.markdown("---")
+        st.subheader("Final analysis report")
+        metrics_path = summary["outputs"]["metrics_csv"]
+        metrics_df = pd.read_csv(metrics_path)
+        if metrics_df.empty:
+            st.info("No classified sperm tracks are available for this report.")
+        else:
+            report_metrics = metrics_df.loc[
+                metrics_df["classification"] != "Insufficient data"
+            ].drop(
+                columns=[
+                    "classification_method",
+                    "progressive_threshold_px_s",
+                    "motile_threshold_px_s",
+                ],
+                errors="ignore",
             )
-
-            c5.metric(
-                "Average Speed",
-                f"{avg_speed:.2f}"
+            report_metrics["measurement_units"] = report_metrics[
+                "measurement_units"
+            ].replace("pixel-based (uncalibrated)", "pixel-based")
+            st.dataframe(
+                report_metrics,
+                use_container_width=True,
             )
+        report_summary = summary.copy()
+        report_summary.pop("classification_method", None)
+        report_summary["classification_counts"] = {
+            category: summary["classification_counts"].get(category, 0)
+            for category in ("Progressive", "Non-Progressive", "Immotile")
+        }
+        report_summary["measurement_units"] = summary["measurement_units"].replace(
+            "pixel-based (uncalibrated)", "pixel-based"
+        )
+        st.download_button(
+            "Download analysis summary (JSON)",
+            data=json.dumps(report_summary, indent=2, ensure_ascii=False),
+            file_name="sperm_motility_analysis_summary.json",
+            mime="application/json",
+        )
 
-            # ============================================
-            # FINAL PREDICTION
-            # ============================================
-            st.markdown("---")
-
-            st.subheader(
-                "🧠 Final Fertility Prediction"
-            )
-
-            if prediction == "Normal Fertility":
-
-                 st.markdown("""
-                    <div style="
-                     background:#d4edda;
-                     padding:25px;
-                     border-radius:15px;
-                     text-align:center;
-                    ">
-                    <h2>✅ Normal Fertility</h2>
-                    <p>Motility parameters appear healthy.</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-
-            else:
-
-                 st.markdown("""
-                     <div style="
-                     background:#f8d7da;
-                     padding:25px;
-                     border-radius:15px;
-                     text-align:center;
-                     ">
-                    <h2>❌ Abnormal Fertility</h2>
-                     <p>Reduced sperm motility detected.</p>
-                     </div>
-                     """, unsafe_allow_html=True)
-            # ============================================
-            # SUMMARY
-            # ============================================
-            st.markdown("---")
-
-            st.subheader(
-                "📋 AI Analysis Summary"
-            )
-
-            if prediction == "Normal Fertility":
-
-                st.success(
-                    """
-                    Motility parameters appear normal.
-                    Progressive sperm movement is good and
-                    fertility potential is likely healthy.
-                    """
-                )
-
-            else:
-
-                st.warning(
-                    """
-                    Reduced sperm motility detected.
-                    High immotile sperm percentage or low
-                    progressive movement may indicate
-                    fertility issues.
-                    """
-                )
-                
 

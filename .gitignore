@@ -19,7 +19,8 @@ frontend/build/
 dataset/
 outputs/
 runs/
-tracking/
+tracking/__pycache__/
+tracking/.pytest_cache/
 backend/models/
 *.pt
 *.pth
